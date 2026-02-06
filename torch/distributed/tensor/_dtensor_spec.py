@@ -88,6 +88,14 @@ class DTensorSpec:
     #     )
     shard_order: ShardOrder = None  # type: ignore[assignment]
 
+    def __fx_create_arg__(self, tracer: Any) -> Any:
+        # Store DTensorSpec as an attribute on the graph module so it is
+        # referenced by name rather than inlined via repr() (which would
+        # require DTensorSpec/DeviceMesh to be in the generated code scope).
+        qualname = tracer.get_fresh_qualname("_dtensor_spec")
+        setattr(tracer.root, qualname, self)
+        return tracer.create_node("get_attr", qualname, (), {})
+
     def __post_init__(self) -> None:
         if not isinstance(self.placements, tuple):
             self.placements = tuple(self.placements)
