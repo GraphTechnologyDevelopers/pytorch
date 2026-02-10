@@ -1082,6 +1082,7 @@ def proxy_call(
     pre_dispatch: bool,
     args: tuple[object, ...],
     kwargs: dict[str, object],
+    types: tuple[type, ...] | None = None,
 ) -> object:
     unrecognized_types: list[type] = []
     flat_args_kwargs, spec = pytree.tree_flatten((args, kwargs))
@@ -1208,8 +1209,66 @@ def proxy_call(
         name=proxy_mode.tracer.graph._target_to_str(func.overloadpacket.__name__),
     )
 
-    with _enable_thunkify(proxy_mode.tracer):
-        out = func(*args, **kwargs)
+    # Try to bypass proxy mode and call fake tensor dispatch directly for eligible ops
+    # This avoids re-entering the proxy mode dispatch for simple operations
+    out = None
+    bypass_succeeded = False
+
+    # Check if we can bypass: no symbolic integers in args and no data-dependent ops
+    def _has_symbolic_ints(obj):
+        """Check if obj contains any SymInt/SymFloat/SymBool values"""
+        if isinstance(obj, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            return True
+        if isinstance(obj, Tensor):
+            # Check for symbolic sizes/strides
+            try:
+                for s in obj.shape:
+                    if isinstance(s, torch.SymInt):
+                        return True
+                for s in obj.stride():
+                    if isinstance(s, torch.SymInt):
+                        return True
+            except Exception:
+                pass
+        if isinstance(obj, (list, tuple)):
+            return any(_has_symbolic_ints(x) for x in obj)
+        if isinstance(obj, dict):
+            return any(_has_symbolic_ints(v) for v in obj.values())
+        return False
+
+    # Determine if we should attempt bypass
+    # Skip ops with multiple returns (structured return types) as they behave differently
+    schema = func._schema
+    has_multiple_returns = len(schema.returns) > 1
+
+    can_bypass = (
+        torch.Tag.data_dependent_output not in func.tags
+        and not has_multiple_returns
+        and not _has_symbolic_ints(args)
+        and not _has_symbolic_ints(kwargs)
+    )
+
+    if can_bypass:
+        # Get the fake mode from the dispatch stack
+        fake_mode = torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE)
+        if fake_mode is not None:
+            try:
+                # Temporarily unset fake mode to avoid re-entry guard in __torch_dispatch__
+                with unset_fake_temporarily():
+                    # Use types passed from __torch_dispatch__ if available
+                    dispatch_types = types if types is not None else ()
+                    with _enable_thunkify(proxy_mode.tracer):
+                        out = fake_mode.__torch_dispatch__(
+                            func, dispatch_types, args, kwargs or {}
+                        )
+                    bypass_succeeded = True
+            except Exception:
+                # Fall back to original path
+                bypass_succeeded = False
+
+    if not bypass_succeeded:
+        with _enable_thunkify(proxy_mode.tracer):
+            out = func(*args, **kwargs)
 
     # In some circumstances, we will be tracing in a situation where a tensor
     # is *statically* known to be a constant (currently, this only happens if
@@ -1248,6 +1307,7 @@ def proxy_call(
     # we can query it if we're asked to item() it at some later point
     if (
         func is torch.ops.aten.lift_fresh_copy.default
+        and out is not None
         and out.numel() <= CONSTANT_NUMEL_LIMIT
     ):
         with unset_fake_temporarily():
@@ -1782,7 +1842,7 @@ class ProxyTorchDispatchMode(TorchDispatchMode):
             if func == prim.device.default:
                 return func(*args, **kwargs)
 
-            return proxy_call(self, func, self.pre_dispatch, args, kwargs)
+            return proxy_call(self, func, self.pre_dispatch, args, kwargs, types)
 
     def __enter__(self) -> Self:
         # Stash and store the previous proxy mode (there may or may not be one)
