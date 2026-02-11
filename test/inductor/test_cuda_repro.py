@@ -2606,7 +2606,7 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         self.assertEqual(eager_out, compile_out)
 
     @skipIfXpu(
-        msg="Explicit attn_mask should not be set when is_causal=True - xpu-ops: 2802"
+        msg="Explicit attn_mask should not be set when is_causal=True - torch-xpu-ops: 2802"
     )
     def test_qwen2_7b_sdpa_input_alignment_requires_recompile(self):
         # SDPA constraints ensures inputs have alignment (8).
@@ -2737,7 +2737,7 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
                 self.assertEqual(eager_div, compiled_div)
 
-    @skipIfXpu(msg="triton dependency - xpu-ops: 2554")
+    @skipIfXpu(msg="triton dependency - torch-xpu-ops: 2554")
     @config.patch({"eager_numerics.division_rounding": False})
     @xfailIfROCm
     def test_truediv_base_not_bitwise_equivalent(self):
@@ -2774,7 +2774,7 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
         self.assertTrue(compile_decimal > Decimal(0))
 
-    @skipIfXpu(msg="Decimal object comparison failed - xpu-ops: 2810")
+    @skipIfXpu(msg="Decimal object comparison failed - torch-xpu-ops: 2810")
     @skipIfRocm(msg="ROCm preserves subnormals by default")
     @config.patch({"eager_numerics.disable_ftz": False})
     def test_not_disabling_ftz_yields_zero(self):
