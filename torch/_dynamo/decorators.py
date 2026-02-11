@@ -12,7 +12,10 @@ from typing import Any, Optional, overload, TYPE_CHECKING, TypeVar, Union
 from typing_extensions import ParamSpec
 
 import torch
+import torch.utils._pytree as pytree
+from torch._guards import detect_fake_mode
 from torch.compiler import is_compiling
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.utils._contextlib import _DecoratorContextManager
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
@@ -32,6 +35,7 @@ from .external_utils import (
     get_nonrecursive_disable_wrapper,
     wrap_dunder_call_ctx_manager,
 )
+from .graph_bytecode_inputs import store_user_object_weakrefs
 from .utils import _get_error_on_graph_break, _set_error_on_graph_break, is_function
 
 
@@ -257,6 +261,52 @@ def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
     weakref.finalize(wrapped, deregister)
 
     return wrapped
+
+
+def _invoke_leaf_function_python(
+    real_impl: Callable[..., Any],
+    fake_impl: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Any:
+    """Call invoke_leaf_function HOP directly from Python.
+
+    This enables @leaf_function to work with make_fx
+    without relying on Dynamo to intercept the call.
+    """
+    from torch._higher_order_ops.flat_apply import func_to_graphable
+    from torch._higher_order_ops.invoke_leaf_function import (
+        convert_modules_to_states,
+        invoke_leaf_function,
+        reconstruct_original_args,
+    )
+
+    captured_modules: list[torch.nn.Module] = []
+    module_to_index: dict[int, int] = {}
+    for val in pytree.tree_flatten(
+        (args, kwargs), is_leaf=lambda x: isinstance(x, torch.nn.Module)
+    )[0]:
+        if isinstance(val, torch.nn.Module) and id(val) not in module_to_index:
+            module_to_index[id(val)] = len(captured_modules)
+            captured_modules.append(val)
+
+    processed = convert_modules_to_states((args, kwargs), module_to_index)
+    flat_args, input_spec = pytree.tree_flatten(processed)
+
+    def _make_wrapper(impl: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(*flat_args: Any) -> Any:
+            with reconstruct_original_args(input_spec, flat_args) as (
+                inner_args,
+                inner_kwargs,
+            ):
+                return impl(*inner_args, **inner_kwargs)
+
+        return wrapper
+
+    store_user_object_weakrefs(*captured_modules)
+    _, real_fn_spec = func_to_graphable(_make_wrapper(real_impl))
+    _, fake_fn_spec = func_to_graphable(_make_wrapper(fake_impl))
+    return invoke_leaf_function(real_fn_spec, fake_fn_spec, *flat_args)
 
 
 def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]:
@@ -520,6 +570,23 @@ def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
     @functools.wraps(fn)
     def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        if get_proxy_mode() is not None or detect_fake_mode(args) is not None:
+            # Call python wrapper to support make_fx tracing
+            if inner._torchdynamo_leaf_fake_fn is None:  # type: ignore[attr-defined]
+                raise ValueError(
+                    f"leaf_function '{getattr(fn, '__name__', fn)}' "
+                    "requires a fake implementation. Please provide one using the @<func>.register_fake "
+                    "decorator. See the leaf_function docstring for details."
+                )
+
+            # pyrefly: ignore [bad-argument-type]
+            return _invoke_leaf_function_python(
+                fn,
+                # pyrefly: ignore [bad-argument-type]
+                inner._torchdynamo_leaf_fake_fn,
+                args,
+                kwargs,
+            )  # type: ignore[attr-defined]
         return fn(*args, **kwargs)
 
     inner._torchdynamo_leaf_real_fn = fn  # type: ignore[attr-defined]
